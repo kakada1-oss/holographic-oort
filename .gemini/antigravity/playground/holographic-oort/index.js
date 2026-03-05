@@ -2,11 +2,18 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const OpenAI = require("openai");
 const axios = require("axios");
+const { exec } = require('child_process');
+const util = require('util');
+const path = require('path');
+const fs = require('fs').promises;
 
 // --- Configuration ---
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = "gpt-4o";
+const MAX_HISTORY = 30;
+const KEEP_RECENT = 20;
+const CONCURRENCY_LIMIT = 1; // Max concurrent requests per chat
 
 if (!TOKEN || !API_KEY) {
     console.error("❌ TELEGRAM_BOT_TOKEN or OPENAI_API_KEY not set in .env");
@@ -23,59 +30,146 @@ const bot = new TelegramBot(TOKEN, {
         }
     }
 });
-const client = new OpenAI({ apiKey: API_KEY });
+
+const client = new OpenAI({ 
+    apiKey: API_KEY,
+    maxRetries: 3,
+    timeout: 30000
+});
 
 console.log("🤖 ChatGPT Bot started.");
 
-// Store conversation history in memory (chatId -> array of messages)
+// --- State Management ---
 const conversations = new Map();
+const processing = new Map(); // chatId -> { count, timestamp }
+const PROCESSING_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
-// Helper to keep history manageable
-function updateHistory(chatId, role, content, tool_calls = null, tool_call_id = null) {
+// --- Helper Functions ---
+
+/**
+ * Initialize conversation history for a chat
+ */
+function initConversation(chatId) {
     if (!conversations.has(chatId)) {
-        conversations.set(chatId, [{ role: "system", content: "You are a helpful and clear AI assistant. You answer concisely unless requested otherwise. You have access to tools." }]);
+        conversations.set(chatId, [{ 
+            role: "system", 
+            content: "You are a helpful and clear AI assistant. You answer concisely unless requested otherwise. You have access to tools." 
+        }]);
     }
+}
+
+/**
+ * Update conversation history with automatic cleanup
+ */
+function updateHistory(chatId, role, content, tool_calls = null, tool_call_id = null) {
+    initConversation(chatId);
     const history = conversations.get(chatId);
 
-    let msg = { role, content };
+    const msg = { role, content };
     if (tool_calls) msg.tool_calls = tool_calls;
     if (tool_call_id) msg.tool_call_id = tool_call_id;
 
     history.push(msg);
 
-    // Limit memory: Keep last 20 messages to avoid cutting tool call pairs easily
-    if (history.length > 30) {
+    // Smart history management: Keep last KEEP_RECENT messages + system prompt
+    if (history.length > MAX_HISTORY) {
         const sys = history[0];
-        const recent = history.slice(-20);
+        const recent = history.slice(-KEEP_RECENT);
         conversations.set(chatId, [sys, ...recent]);
+    }
+}
+
+/**
+ * Check if chat is currently processing
+ */
+function isProcessing(chatId) {
+    const state = processing.get(chatId);
+    if (!state) return false;
+    
+    // Clear stale processing states
+    if (Date.now() - state.timestamp > PROCESSING_TIMEOUT) {
+        processing.delete(chatId);
+        return false;
+    }
+    
+    return state.count >= CONCURRENCY_LIMIT;
+}
+
+/**
+ * Set processing state
+ */
+function setProcessing(chatId, active = true) {
+    if (active) {
+        const state = processing.get(chatId) || { count: 0, timestamp: Date.now() };
+        state.count++;
+        state.timestamp = Date.now();
+        processing.set(chatId, state);
+    } else {
+        const state = processing.get(chatId);
+        if (state) {
+            state.count--;
+            if (state.count <= 0) processing.delete(chatId);
+        }
     }
 }
 
 // --- Command Handlers ---
 
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "Hi! I am ChatGPT. Send me any text or a photo, and I will respond.");
+    bot.sendMessage(msg.chat.id, 
+        "👋 Hi! I am ChatGPT.\n\n" +
+        "📝 Send me any text or a photo, and I will respond.\n" +
+        "📊 I can search and send Excel files from your computer.\n" +
+        "🔄 Use /clear to reset our conversation."
+    );
 });
 
 bot.onText(/\/clear/, (msg) => {
     conversations.delete(msg.chat.id);
-    bot.sendMessage(msg.chat.id, "Context cleared. Let's start fresh!");
+    processing.delete(msg.chat.id);
+    bot.sendMessage(msg.chat.id, "✅ Context cleared. Let's start fresh!");
+});
+
+bot.onText(/\/help/, (msg) => {
+    bot.sendMessage(msg.chat.id,
+        "📖 **Available Commands:**\n\n" +
+        "/start - Start the bot\n" +
+        "/clear - Clear conversation history\n" +
+        "/help - Show this help message\n\n" +
+        "💡 **Tips:**\n" +
+        "• Send text or photos\n" +
+        "• Ask me to find Excel files\n" +
+        "• I remember our conversation context"
+    );
 });
 
 // --- Photo Handler (Vision) ---
 
 bot.on("photo", async (msg) => {
     const chatId = msg.chat.id;
-    const photo = msg.photo[msg.photo.length - 1]; // Get highest resolution photo
+    
+    if (isProcessing(chatId)) {
+        bot.sendMessage(chatId, "⏳ Please wait, I'm still working on your previous request...");
+        return;
+    }
+
+    const photo = msg.photo[msg.photo.length - 1]; // Get highest resolution
     const caption = msg.caption || "What is in this image?";
 
+    setProcessing(chatId, true);
+
     try {
-        bot.sendChatAction(chatId, "typing");
+        await bot.sendChatAction(chatId, "typing");
 
         const file = await bot.getFile(photo.file_id);
         const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
 
-        const response = await axios.get(url, { responseType: "arraybuffer" });
+        const response = await axios.get(url, { 
+            responseType: "arraybuffer",
+            timeout: 10000,
+            maxContentLength: 20 * 1024 * 1024 // 20MB limit
+        });
+        
         const base64Image = Buffer.from(response.data, "binary").toString("base64");
 
         const messages = [
@@ -85,7 +179,10 @@ bot.on("photo", async (msg) => {
                     { type: "text", text: caption },
                     {
                         type: "image_url",
-                        image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+                        image_url: { 
+                            url: `data:image/jpeg;base64,${base64Image}`,
+                            detail: "auto"
+                        }
                     }
                 ]
             }
@@ -94,24 +191,27 @@ bot.on("photo", async (msg) => {
         const completion = await client.chat.completions.create({
             model: MODEL,
             messages: messages,
+            max_tokens: 1000
         });
 
         const reply = completion.choices[0].message.content;
-        bot.sendMessage(chatId, reply);
+        await bot.sendMessage(chatId, reply);
 
-        // Update history for subsequent text-only chats
         updateHistory(chatId, "user", `[User sent an image with caption: ${caption}]`);
         updateHistory(chatId, "assistant", reply);
 
     } catch (err) {
         console.error("Photo Error:", err.message);
-        bot.sendMessage(chatId, "Sorry, I couldn't process that image.");
+        const errorMsg = err.response?.status === 413 
+            ? "Sorry, that image is too large. Please try with a smaller image." 
+            : "Sorry, I couldn't process that image.";
+        await bot.sendMessage(chatId, errorMsg);
+    } finally {
+        setProcessing(chatId, false);
     }
 });
 
 // --- Text Handler ---
-
-const processing = new Set();
 
 bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
@@ -120,14 +220,16 @@ bot.on("message", async (msg) => {
     // Ignore commands and non-text
     if (!text || text.startsWith("/")) return;
 
-    if (processing.has(chatId)) {
-        bot.sendMessage(chatId, "⏳ Please wait, I'm still working on your previous request...");
+    if (isProcessing(chatId)) {
+        await bot.sendMessage(chatId, "⏳ Please wait, I'm still working on your previous request...");
         return;
     }
-    processing.add(chatId);
+
+    setProcessing(chatId, true);
 
     try {
-        bot.sendChatAction(chatId, "typing");
+        await bot.sendChatAction(chatId, "typing");
+        initConversation(chatId);
         updateHistory(chatId, "user", text);
 
         const tools = [
@@ -135,13 +237,20 @@ bot.on("message", async (msg) => {
                 type: "function",
                 function: {
                     name: "find_and_send_excel",
-                    description: "Find an Excel file (.xls, .xlsx) on the computer and send it to the user via Telegram.",
+                    description: "Find an Excel file (.xls, .xlsx) by name and optional folder, then send it via Telegram.",
                     parameters: {
                         type: "object",
                         properties: {
-                            fileName: { type: "string", description: "The name of the file to search for, e.g. 'Stock + Price List'" },
-                            folderName: { type: "string", description: "The name of the folder where the file might be located, e.g. 'Telegram'" }
+                            fileName: { 
+                                type: "string", 
+                                description: "The name or part of the filename to search for, e.g. 'Price List'" 
+                            },
+                            folderName: { 
+                                type: "string", 
+                                description: "Optional folder name where the file might be located, e.g. 'Downloads'" 
+                            }
                         },
+                        required: []
                     },
                 },
             }
@@ -152,6 +261,8 @@ bot.on("message", async (msg) => {
             messages: conversations.get(chatId),
             tools: tools,
             tool_choice: "auto",
+            temperature: 0.7,
+            max_tokens: 1000
         });
 
         let responseMessage = completion.choices[0].message;
@@ -161,58 +272,18 @@ bot.on("message", async (msg) => {
 
             for (const toolCall of responseMessage.tool_calls) {
                 if (toolCall.function.name === "find_and_send_excel") {
-                    try {
-                        const args = JSON.parse(toolCall.function.arguments || "{}");
-                        const fileName = (args.fileName || "").replace(/['"]/g, "");
-                        const folderName = (args.folderName || "").replace(/['"]/g, "");
-
-                        bot.sendMessage(chatId, `🔍 Searching for ${fileName ? `"${fileName}"` : "an Excel file"}${folderName ? ` in "${folderName}"` : ""}...`);
-
-                        const util = require('util');
-                        const { exec } = require('child_process');
-                        const execAsync = util.promisify(exec);
-
-                        // We use a base64 encoded command because it completely mitigates quotes/special chars issues in the node shell exec layer
-                        const psCmd = `
-                        $ErrorActionPreference = 'SilentlyContinue'
-                        $files = Get-ChildItem -Path "$env:USERPROFILE" -Filter "*${fileName}*.xls*" -Recurse -File
-                        if ('${folderName}') {
-                            $files = $files | Where-Object { $_.DirectoryName -match '${folderName}' }
-                        }
-                        if ($files) {
-                            if ($files.Count -gt 0) { Write-Output $files[0].FullName }
-                            else { Write-Output $files.FullName }
-                        }
-                        `.trim();
-
-                        const b64Script = Buffer.from(psCmd, 'utf16le').toString('base64');
-                        const cmd = `powershell -ExecutionPolicy Bypass -NoProfile -EncodedCommand ${b64Script}`;
-
-                        const { stdout } = await execAsync(cmd);
-                        const filePath = stdout.trim();
-
-                        if (filePath && filePath !== "") {
-                            await bot.sendDocument(chatId, filePath);
-                            updateHistory(chatId, "tool", `Successfully found and sent file: ${filePath}`, null, toolCall.id);
-                        } else {
-                            updateHistory(chatId, "tool", "No Excel file matching the search criteria was found.", null, toolCall.id);
-                            bot.sendMessage(chatId, "❌ I couldn't find any file matching your criteria. Try being more brief with the name.");
-                        }
-                    } catch (error) {
-                        console.error("Tool execution error:", error);
-                        updateHistory(chatId, "tool", "An error occurred while searching for the file.", null, toolCall.id);
-                        bot.sendMessage(chatId, "⚠️ An error occurred while searching for the file.");
-                    }
+                    await handleExcelSearch(chatId, toolCall);
                 } else {
-                    // OpenAI requires responding properly to EVERY tool_call_id
                     updateHistory(chatId, "tool", "Error: Unknown tool called.", null, toolCall.id);
                 }
             }
 
-            // Get a new completion after the tool call
+            // Get final response after tool execution
             completion = await client.chat.completions.create({
                 model: MODEL,
                 messages: conversations.get(chatId),
+                temperature: 0.7,
+                max_tokens: 1000
             });
             responseMessage = completion.choices[0].message;
         }
@@ -220,14 +291,96 @@ bot.on("message", async (msg) => {
         const reply = responseMessage.content;
         if (reply) {
             updateHistory(chatId, "assistant", reply);
-            bot.sendMessage(chatId, reply);
+            await bot.sendMessage(chatId, reply);
         }
     } catch (err) {
         console.error("Text Error:", err.message);
-        bot.sendMessage(chatId, "I'm having trouble thinking right now. Please try again later.");
+        const errorMsg = err.code === "ETIMEDOUT" || err.code === "ECONNRESET"
+            ? "I'm experiencing connection issues. Please try again in a moment."
+            : "I'm having trouble thinking right now. Please try again later.";
+        await bot.sendMessage(chatId, errorMsg);
     } finally {
-        processing.delete(chatId);
+        setProcessing(chatId, false);
     }
 });
+
+/**
+ * Handle Excel file search tool
+ */
+async function handleExcelSearch(chatId, toolCall) {
+    const execAsync = util.promisify(exec);
+    
+    try {
+        const args = JSON.parse(toolCall.function.arguments || "{}");
+        const fileName = (args.fileName || "").replace(/['"]/g, "").trim();
+        const folderName = (args.folderName || "").replace(/['"]/g, "").trim();
+
+        await bot.sendMessage(chatId, 
+            `🔍 Searching for ${fileName ? `"${fileName}"` : "an Excel file"}${folderName ? ` in "${folderName}"` : ""}...`
+        );
+
+        // Optimized PowerShell command with better error handling
+        const psCmd = `
+            $ErrorActionPreference = 'SilentlyContinue'
+            $filter = if ('${fileName}') { "*${fileName}*.xls*" } else { "*.xls*" }
+            $files = Get-ChildItem -Path "$env:USERPROFILE" -Filter $filter -Recurse -File -ErrorAction SilentlyContinue
+            if ($files) {
+                if ('${folderName}') {
+                    $files = $files | Where-Object { $_.DirectoryName -like '*${folderName}*' }
+                }
+                if ($files.Count -gt 0) {
+                    Write-Output $files[0].FullName
+                } elseif ($files.Count -eq 1) {
+                    Write-Output $files.FullName
+                }
+            }
+        `.trim();
+
+        const b64Script = Buffer.from(psCmd, 'utf16le').toString('base64');
+        const cmd = `powershell -ExecutionPolicy Bypass -NoProfile -EncodedCommand ${b64Script}`;
+
+        const { stdout, stderr } = await execAsync(cmd, {
+            timeout: 30000, // 30s timeout
+            maxBuffer: 5 * 1024 * 1024 // 5MB buffer
+        });
+
+        const filePath = stdout.trim();
+
+        if (filePath && filePath !== "" && await fileExists(filePath)) {
+            await bot.sendDocument(chatId, filePath);
+            updateHistory(chatId, "tool", `Successfully found and sent file: ${filePath}`, null, toolCall.id);
+        } else {
+            updateHistory(chatId, "tool", "No Excel file matching the search criteria was found.", null, toolCall.id);
+            await bot.sendMessage(chatId, 
+                "❌ No matching file found.\n\n" +
+                "💡 Tips:\n" +
+                "• Use more specific filename keywords\n" +
+                "• Try without specifying a folder\n" +
+                "• Check if the file exists in your user directory"
+            );
+        }
+    } catch (error) {
+        console.error("Tool execution error:", error);
+        updateHistory(chatId, "tool", "An error occurred while searching for the file.", null, toolCall.id);
+        
+        let errorMsg = "⚠️ An error occurred while searching for the file.";
+        if (error.code === 'ETIMEDOUT') {
+            errorMsg = "⏱️ Search timed out. The file search took too long. Please try a more specific filename.";
+        }
+        await bot.sendMessage(chatId, errorMsg);
+    }
+}
+
+/**
+ * Check if file exists asynchronously
+ */
+async function fileExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 console.log("✅ Bot is ready at https://t.me/your_bot_name (use your own token link)");
